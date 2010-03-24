@@ -34,6 +34,7 @@ create table followers_a
 create index followers_a_friend_idx on followers_a(friend);
 create index followers_a_append_frozen_idx on followers_a(append_frozen);
 create index followers_a_array_length_followers_idx on followers_a(array_length(followers, 1));
+create index followers_a_expanded on friends_a using gin (followers);
 
 create view all_friends as
     select follower, array_agg(friend) as friends
@@ -42,7 +43,7 @@ create view all_friends as
 -- Unpacsk and unions with the 
 create view friendships_friend_to_follower as 
     select unnest(followers) as follower, friend from followers_a
-    union select follower, friend from friendships;
+    union all select follower, friend from friendships;
 
 -- does same, but ordered
 create view friendships_friend_to_follower_ordered as 
@@ -63,11 +64,12 @@ create table friends_a
 create index friends_a_follower_idx on friends_a(follower);
 create index friends_a_append_frozen_idx on friends_a(append_frozen);
 create index friends_a_array_length_friends_idx on friends_a(array_length(friends, 1));
+create index friends_a_expanded on friends_a using gin (friends);
 
 --unpacs friends_a
 create view friendships_follower_to_friend as 
     select follower, unnest(friends) as friend from friends_a
-    union select follower, friend from friendships;
+    union all select follower, friend from friendships;
 
 --unpacs friends_a
 create view friendships_follower_to_friend_ordered as 
@@ -77,17 +79,12 @@ create view friendships_follower_to_friend_ordered as
 
 
 
-CREATE OR REPLACE FUNCTION cleanup_inner ()
-RETURNS TABLE (id integer, follower integer, friend integer)
-LANGUAGE SQL AS $$
-    DELETE from friendships returning id, follower, friend;
-$$;
-
-create or replace function cleanup()
+CREATE OR REPLACE FUNCTION cleanup ()
 RETURNS TABLE (follower integer, friend integer)
 LANGUAGE SQL AS $$
-	select follower, friend from cleanup_inner() order by id
+    DELETE from friendships returning follower, friend;
 $$;
+
 
 -- Populate followers_a with data from friendships
 CREATE FUNCTION move_friends() RETURNS void AS $$
@@ -97,6 +94,8 @@ BEGIN
     create temporary table friendships_temp
         as select * from cleanup();
 
+	create index ft_i on friendships_temp (friend);
+	create index ft_i2 on friendships_temp (follower);
 
     -- Populate followers_a
     update followers_a as fs
@@ -111,8 +110,11 @@ BEGIN
     -- Insert the ones that didn't exist before (and the update didn't do)
     insert into followers_a  (followers, friend)
         select array_agg(follower), friend as followers
-        from friendships_temp
-        where friend not in (select friend from followers_a where append_frozen is false)
+        from friendships_temp, 
+			((select friend as ff from followers_a where append_frozen is false) except (select friend from followers_a where append_frozen is false)) as ftof
+		where friend = ftof.ff
+        --where friend in ((select friend from followers_a where append_frozen is false) except (select friend from followers_a where append_frozen is false))
+        --where friend not in (select friend from followers_a where append_frozen is false intersect (select friend from friendships_temp))
         group by friend;
 
     -- Freeze the rows that have grown too big
@@ -131,11 +133,17 @@ BEGIN
         where af.follower = fs.follower
               and fs.append_frozen is false;
 
+
+
+
     -- Insert the ones that didn't exist before (and the update didn't do)
     insert into friends_a  (follower, friends)
         select  follower as followers, array_agg(friend)
-        from friendships_temp
-        where follower not in (select follower from friends_a where append_frozen is false)
+        from friendships_temp,
+			((select follower as ff from friendships_temp) except (select follower from friends_a where append_frozen is false)) as ftof
+		where follower = ftof.ff
+        --where follower in ((select follower from friendships_temp) except (select follower from friends_a where append_frozen is false))
+        --where follower not in (select follower from friends_a where append_frozen is false intersect (select follower from friendships_temp))
         group by follower;
 
     -- Freeze the rows that have grown too big
@@ -145,7 +153,7 @@ BEGIN
               and append_frozen is false;
 
     -- Populate friends_a
-    drop table friendships_temp;
+    drop table friendships_temp cascade;
 --commit;
     
 END;
