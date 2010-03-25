@@ -39,10 +39,10 @@ create view friendships_friend_to_follower as
 
 -- does same, but ordered
 create view friendships_friend_to_follower_ordered_desc as 
-	(select follower, friend from friendships order by id desc)
+    (select follower, friend from friendships order by id desc)
     union all 
     (select unnest(followers) as follower, friend from followers_a order by id desc)
-	;
+    ;
 
 CREATE SEQUENCE friends_a_seq;
 
@@ -66,10 +66,10 @@ create view friendships_follower_to_friend as
 
 --unpacs friends_a
 create view friendships_follower_to_friend_ordered_desc as 
-	(select follower, friend from friendships order by id desc)
+    (select follower, friend from friendships order by id desc)
     union all
     (select follower, unnest(friends) as friend from friends_a order by id desc)
-	;
+    ;
 
 
 
@@ -141,35 +141,56 @@ LANGUAGE SQL AS $$
 $$;
 
 
+
 -- Populate followers_a with data from friendships
 CREATE OR REPLACE FUNCTION move_friends() RETURNS void AS $$
 DECLARE
 BEGIN
 --begin;
-    create temporary table friendships_temp
-        as select * from cleanup();
 
-	create index ft_id on friendships_temp (id);
-	create index ft_i on friendships_temp (friend);
-	create index ft_i2 on friendships_temp (follower);
 
+    -- COPY TO A NEW TEMP TABLE where we have batches.
+    create temporary table batch_followers as
+    select f.follower, f.friend, f.id,
+            trunc(((rank() OVER
+                              (partition by f.friend order by f.id)) +
+                        COALESCE(array_length(foa.followers,1), 100) - 1) / 100.0) as follower_batch,
+            trunc(((rank() OVER
+                          (partition by f.follower order by f.id)) +
+                    COALESCE(array_length(ffa.friends,1), 100) - 1) / 100.0) as friend_batch
+
+            from cleanup() as f
+            left outer join followers_a as foa on (foa.friend = f.friend)
+            left outer join friends_a as ffa on (ffa.follower = f.follower)
+            where (ffa.append_frozen is not true and foa.append_frozen is not true);
+
+    create index bfo_id  on batch_followers(id);
+    create index bfo_fid on batch_followers(follower);
+    create index bff_fid on batch_followers(friend);
+    create index bfo_bid on batch_followers(follower_batch);
+    create index bff_bid on batch_followers(friend_batch);
+            
+    
+    analyze batch_followers;
+    
     -- Populate followers_a
     update followers_a as fs
         set followers =  af.followers || fs.followers
         from (
             select array_agg(follower order by id desc) as followers, friend
-                from friendships_temp
-                group by friend) as af
+                from batch_followers
+                where follower_batch = 0
+                group by friend ) as af
         where af.friend = fs.friend
               and fs.append_frozen is false;
 
     -- Insert the ones that didn't exist before (and the update didn't do)
-    insert into followers_a  (followers, friend)
+    insert into followers_a (followers, friend)
         select array_agg(follower order by id desc), friend as followers
-        from friendships_temp, 
-			((select friend as ff from friendships_temp) except (select friend from followers_a where append_frozen is false)) as ftof
-		where friend = ftof.ff
-        group by friend;
+        from batch_followers as bf
+        where bf.follower_batch <> 0
+        group by friend, bf.follower_batch
+        order by bf.follower_batch;
         --where friend in ((select friend from followers_a where append_frozen is false) except (select friend from followers_a where append_frozen is false))
         --where friend not in (select friend from followers_a where append_frozen is false intersect (select friend from friendships_temp))
 
@@ -184,7 +205,8 @@ BEGIN
         set friends = af.friends || fs.friends
         from (
             select array_agg(friend order by id desc) as friends, follower
-                from friendships_temp
+                from batch_followers
+                where friend_batch = 0
                 group by follower) as af
         where af.follower = fs.follower
               and fs.append_frozen is false;
@@ -193,12 +215,13 @@ BEGIN
     -- Insert the ones that didn't exist before (and the update didn't do)
     insert into friends_a  (follower, friends)
         select  follower as followers, array_agg(friend order by id desc)
-        from friendships_temp,
-			((select follower as ff from friendships_temp) except (select follower from friends_a where append_frozen is false)) as ftof
-		where follower = ftof.ff
+        from batch_followers as bf
+        where bf.friend_batch <> 0
         --where follower in ((select follower from friendships_temp) except (select follower from friends_a where append_frozen is false))
         --where follower not in (select follower from friends_a where append_frozen is false intersect (select follower from friendships_temp))
-        group by follower;
+        group by follower, bf.friend_batch
+        order by bf.friend_batch;
+        
 
     -- Freeze the rows that have grown too big
     update friends_a
@@ -207,7 +230,7 @@ BEGIN
               and append_frozen is false;
 
     -- Populate friends_a
-    drop table friendships_temp cascade;
+    drop table batch_followers cascade;
 --commit;
     
 END;
@@ -218,16 +241,16 @@ $$ LANGUAGE plpgsql;
 
 --populate some data to copy over
 copy friendships (follower, friend) from stdin;
-1	1
-2	2
-1	2
-2	1
-2	3
-2	4
-2	5
-1	3
-4	1
-3	1
+1   1
+2   2
+1   2
+2   1
+2   3
+2   4
+2   5
+1   3
+4   1
+3   1
 \.
 
 -- move the data over
@@ -236,30 +259,30 @@ select move_friends();
 
 insert into friendships (follower, friend) select generate_series(100,200), 1;
 copy friendships (follower, friend) from stdin;
-1	6
-2	7
-1	2
-2	8
-2	66
-2	44
-2	33
-21	3
-44	1
+1   6
+2   7
+1   2
+2   8
+2   66
+2   44
+2   33
+21  3
+44  1
 \.
 
 select move_friends();
 
 insert into friendships (follower, friend) select generate_series(200,300), 1;
 copy friendships (follower, friend) from stdin;
-1	6
-2	7
-1	2
-2	8
-2	66
-2	44
-2	33
-21	3
-44	1
+1   6
+2   7
+1   2
+2   8
+2   66
+2   44
+2   33
+21  3
+44  1
 \.
 
 select move_friends();
