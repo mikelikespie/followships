@@ -101,8 +101,10 @@ BEGIN
         set friend_ids   =  fbs.friend_ids   || fs.friend_ids,
             follower_ids =  fbs.follower_ids || fs.follower_ids,
             max_id = fbs.id,
-            append_frozen = coalesce(array_length(fbs.friend_ids, 1) + array_length(fs.friend_ids, 1) >= 100, false) or
-                            coalesce(array_length(fbs.follower_ids, 1) + array_length(fs.follower_ids, 1) >= 100, false)
+            append_frozen = coalesce(array_length(fbs.friend_ids, 1) +
+                                     array_length(fs.friend_ids, 1) >= 100, false) or
+                            coalesce(array_length(fbs.follower_ids, 1) +
+                                     array_length(fs.follower_ids, 1) >= 100, false)
         from followship_batches_rollup as fbs
         where fbs.user_id = fs.user_id
               and fbs.batch = 0
