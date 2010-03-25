@@ -51,10 +51,12 @@ CREATE AGGREGATE array_accum (anyelement) (
 CREATE OR REPLACE FUNCTION move_friends() RETURNS void AS $$
 DECLARE
 BEGIN
+
+    --TODO have this delete the stuff from followships
     create temporary table followship_staging as select * from followships;
 
-    create temporary view followship_batches_l as
-    select  l.friend_id as user_id,
+    create temporary view followship_batches_union as
+    (select  l.friend_id as user_id,
             trunc((
                 (rank() OVER (partition by l.friend_id order by l.id)) +
                     COALESCE(array_length(fs.follower_ids,1), 100) - 1)
@@ -65,10 +67,9 @@ BEGIN
             null::integer as friend_id
             from followship_staging as l
             left outer join followship_rollups as fs on (
-                l.friend_id = fs.user_id and fs.append_frozen is false);
-
-    create temporary view followship_batches_r as
-    select  r.follower_id as user_id,
+                l.friend_id = fs.user_id and fs.append_frozen is false))
+    union all
+    (select  r.follower_id as user_id,
             trunc((
                 (rank() OVER (partition by r.follower_id order by r.id)) +
                     COALESCE(array_length(fs.friend_ids,1), 100) - 1)
@@ -79,12 +80,7 @@ BEGIN
             r.friend_id as friend_id
         from followship_staging as r
         left outer join followship_rollups as fs on (
-            r.follower_id = fs.user_id and fs.append_frozen is false);
-
-    create temporary view followship_batches_union as
-    (select * from followship_batches_l)
-    union all
-    (select * from followship_batches_r);
+            r.follower_id = fs.user_id and fs.append_frozen is false));
 
     create temporary table followship_batches_rollup as
     select
@@ -115,6 +111,7 @@ BEGIN
         coalesce(array_length(follower_ids, 1), 0) >= 100 or coalesce(array_length(friend_ids, 1), 0) >= 100 as append_frozen, 
         follower_ids, friend_ids
         from followship_batches_rollup
+        where batch <> 0
         order by batch;
 
     drop table followship_staging cascade;
