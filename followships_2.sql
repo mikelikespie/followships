@@ -27,8 +27,8 @@ create table followship_rollups
     max_id int not null, -- for sorting
     user_id int not null,
     append_frozen bool default false not null,
-    follower_ids int[] not null CHECK (my_array_length(follower_ids) <= 100),
-    friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 100)
+    follower_ids int[] not null CHECK (my_array_length(follower_ids) <= 256),
+    friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 256)
 );
 
 create unique index only_one_non_frozen on followship_rollups(user_id, NULLIF(append_frozen, true)); -- NULLS are always unique from each other
@@ -59,43 +59,40 @@ CREATE AGGREGATE array_accum (anyelement) (
     initcond = '{}'
 );
 
-CREATE OR REPLACE FUNCTION move_friends() RETURNS void AS $$
-DECLARE
-start timestamptz;
+CREATE OR REPLACE FUNCTION move_friends_from(tablename text)
+RETURNS void as $$
+DECLARE start timestamptz;
 BEGIN
-    --TODO have this delete the stuff from followships
-    raise notice 'copying to staging'; start := timeofday()::timestamptz;
-    create temporary table followship_staging as select * from followships for update;
-    raise notice 'staging copied  took %', timeofday()::timestamptz - start;
+    execute 'create temporary view followship_staging_v as select * from ' || quote_ident($1); -- Just make a view to make it easy
 
     create temporary view followship_batches_union as
     (select  l.friend_id as user_id,
             trunc((
                 (count(*) OVER (partition by l.friend_id order by l.id)) +
-                case when fs.follower_ids is null then 100 else my_array_length(fs.follower_ids) end - 1)
-                / 100.0) as batch,
+                case when fs.follower_ids is null then 256 else my_array_length(fs.follower_ids) end - 1)
+                / 256.0) as batch,
             l.id as follower_ord_id,
             l.follower_id as follower_id,
             null::integer as friend_ord_id,
             null::integer as friend_id
-            from followship_staging as l
+            from followship_staging_v as l
             left outer join followship_rollups as fs on (
                 l.friend_id = fs.user_id and fs.append_frozen is false))
     union all
     (select  r.follower_id as user_id,
             trunc((
                 (count(*) OVER (partition by r.follower_id order by r.id)) +
-                case when fs.friend_ids is null then 100 else my_array_length(fs.friend_ids) end - 1)
-                / 100.0) as batch,
+                case when fs.friend_ids is null then 256 else my_array_length(fs.friend_ids) end - 1)
+                / 256.0) as batch,
             null::integer as follower_ord_id,
             null::integer as follower_id,
             r.id as friend_ord_id,
             r.friend_id as friend_id
-        from followship_staging as r
+        from followship_staging_v as r
         left outer join followship_rollups as fs on (
             r.follower_id = fs.user_id and fs.append_frozen is false));
 
-    raise notice 'rolling up data into temp table'; start := timeofday()::timestamptz;
+    raise log 'rolling up data into temp table'; start := timeofday()::timestamptz;
     create temporary table followship_batches_rollup as
     select
         case when max(follower_ord_id) is not null then max(follower_ord_id) else max(friend_ord_id) end as id,
@@ -105,43 +102,86 @@ BEGIN
         coalesce(array_accum(friend_id order by friend_ord_id desc), ARRAY[]::int[]) as friend_ids
     from followship_batches_union
     group by user_id, batch;
-    raise notice 'rollup finished. took %', timeofday()::timestamptz - start;
+    raise log 'rollup finished. took %', timeofday()::timestamptz - start;
 
 
     -- Populate followers_a
-    raise notice 'updating rollups'; start := timeofday()::timestamptz;
+    raise log 'updating rollups'; start := timeofday()::timestamptz;
     update followship_rollups as fs
         set friend_ids   =  fbs.friend_ids   || coalesce(fs.friend_ids, ARRAY[]::int[]),
             follower_ids =  fbs.follower_ids || coalesce(fs.follower_ids, ARRAY[]::int[]),
             max_id = fbs.id,
-            append_frozen = my_array_length(fbs.friend_ids) + my_array_length(fs.friend_ids) >= 100 or
-                            my_array_length(fbs.follower_ids) + my_array_length(fs.follower_ids) >= 100
+            append_frozen = my_array_length(fbs.friend_ids) + my_array_length(fs.friend_ids) >= 256 or
+                            my_array_length(fbs.follower_ids) + my_array_length(fs.follower_ids) >= 256
         from followship_batches_rollup as fbs
         where fbs.user_id = fs.user_id
               and fbs.batch = 0
               and fs.append_frozen is false;
-    raise notice 'updating rollups finished. took %', timeofday()::timestamptz - start;
+    raise log 'updating rollups finished. took %', timeofday()::timestamptz - start;
 
-    raise notice 'inserting rollups'; start := timeofday()::timestamptz;
+    raise log 'inserting rollups'; start := timeofday()::timestamptz;
     insert into followship_rollups 
         select id, user_id, 
-        my_array_length(follower_ids) >= 100 or my_array_length(friend_ids) >= 100 as append_frozen, 
+        my_array_length(follower_ids) >= 256 or my_array_length(friend_ids) >= 256 as append_frozen, 
         follower_ids, friend_ids
         from followship_batches_rollup
         where batch <> 0
         order by batch;
-    raise notice 'inserting rollups finished. took %', timeofday()::timestamptz - start;
+    raise log 'inserting rollups finished. took %', timeofday()::timestamptz - start;
 
-    raise notice 'deleting old rows'; start := timeofday()::timestamptz;
-    delete from followships using followship_staging
-        where followships.id = followship_staging.id;
-    raise notice 'deleting finished. took %', timeofday()::timestamptz - start;
-
-    drop view followship_batches_union;
-    drop table followship_staging cascade;
+    drop view followship_batches_union cascade;
+    drop view followship_staging_v cascade;
     drop table followship_batches_rollup cascade;
 END;
 $$ LANGUAGE plpgsql;
+    
+CREATE OR REPLACE FUNCTION move_friends() RETURNS void AS $$
+DECLARE
+start timestamptz;
+BEGIN
+    --TODO have this delete the stuff from followships
+    raise log 'copying to staging'; start := timeofday()::timestamptz;
+    create temporary table followship_staging as select * from followships for update;
+    raise log 'staging copied  took %', timeofday()::timestamptz - start;
+    
+    perform move_friends_from('followship_staging');
+
+    raise log 'deleting old rows'; start := timeofday()::timestamptz;
+    delete from followships using followship_staging
+        where followships.id = followship_staging.id;
+    raise log 'deleting finished. took %', timeofday()::timestamptz - start;
+
+    drop table followship_staging cascade;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ONLY USE THIS when there's no stuff being loaded into followships
+CREATE OR REPLACE FUNCTION bulk_load_friends(filepath text) RETURNS void AS $$
+DECLARE
+start timestamptz;
+BEGIN
+
+    create temporary table followship_staging
+    (
+        id int not null default nextval('followships_seq'),
+        follower_id int,
+        friend_id int
+    );
+
+    --TODO have this delete the stuff from followships
+    raise notice 'copying to staging'; start := timeofday()::timestamptz;
+    execute 'copy followship_staging (follower_id, friend_id) from ' || quote_literal($1) || ' with csv';
+    raise notice 'staging copied  took %', timeofday()::timestamptz - start;
+    
+    raise notice 'moving friends from staging'; start := timeofday()::timestamptz;
+    perform move_friends_from('followship_staging');
+    raise notice 'move took  took %', timeofday()::timestamptz - start;
+
+    drop table followship_staging cascade;
+END;
+$$ LANGUAGE plpgsql;
+
 
 create view friends_of_order_desc as 
     (select follower_id as user_id, friend_id from followships order by id desc)
