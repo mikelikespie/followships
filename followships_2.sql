@@ -216,7 +216,7 @@ $$;
 
 
 -- Return true or false if the followership exists
-create or replace function has_friend(user_id integer, follower_id integer)
+create or replace function has_friend(user_id integer, friend_id integer)
 returns boolean
 language sql as $$
     (select true from followships where follower_id = $1 and friend_id = $2)
