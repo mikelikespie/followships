@@ -61,8 +61,8 @@ array_agg_finalfn_default_empty(PG_FUNCTION_ARGS)
 	 * avoid possible Assert failure in 8.4beta installations, where it is
 	 * possible for users to create NULL constants of type internal.
 	 */
-	if (PG_ARGISNULL(0))
-		PG_RETURN_DATUM(PointerGetDatum(construct_empty_array(retType)));		/* returns null iff no input values */
+	if (PG_ARGISNULL(0) || !state)
+		PG_RETURN_POINTER(construct_empty_array(retType));		/* returns null iff no input values */
 
 	/* cannot be called directly because of internal-type argument */
 	Assert(AggCheckCallContext(fcinfo, NULL));
