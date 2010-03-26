@@ -9,7 +9,7 @@ This is a module for maintaining followships.
 
 Requirements
 ============
-Postgresql 9.0 (Alpha) (and 8.5 possibly works as well)
+Postgresql 9.0 (Alpha)
 
 
 Installation
@@ -52,7 +52,7 @@ Ok, our schema is installed.
 Operations
 ==========
 
-Everything we created from followships_2.sql is in the schema followship.  To be
+Everything we created from followships.sql is in the schema followship.  To be
 able to access these, one must either prefix the function calls and table names
 with ``followship.`` or call ``set search_path to followship, public;`` at the
 beginning of your psql session.
