@@ -234,11 +234,11 @@ BEGIN
     delete from followships where follower_id = $1 and friend_id = $2;
 
     update followship_rollups
-        set follower_ids = follower_ids - $1::int
+        set follower_ids = followship_intarray_del_elem(follower_ids, $1)
         where followship_rollups.user_id = $2 and follower_ids @> ARRAY[$1];
 
     update followship_rollups
-        set friend_ids = friend_ids - $2::int
+        set friend_ids = followship_intarray_del_elem(friend_ids, $2)
         where followship_rollups.user_id = $1 and friend_ids @> ARRAY[$1];
         
 END

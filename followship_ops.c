@@ -1,8 +1,8 @@
 #include "postgres.h"
 #include "utils/array.h"
+#include "catalog/pg_type.h"
 
 PG_FUNCTION_INFO_V1(array_agg_transfn_not_null);
-PG_FUNCTION_INFO_V1(array_agg_finalfn_default_empty);
 
 
 /*
@@ -31,13 +31,16 @@ array_agg_transfn_not_null(PG_FUNCTION_ARGS)
 
 	if (!PG_ARGISNULL(1))
 	{
-		elem = PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1);
+		
+		elem = PG_GETARG_DATUM(1);
 		state = accumArrayResult(state,
 								 elem,
 								 PG_ARGISNULL(1),
 								 arg1_typeid,
 								 aggcontext);
-	}
+	} else if (PG_ARGISNULL(0)) 
+		PG_RETURN_NULL();
+
 
 	/*
 	 * The transition type for array_agg() is declared to be "internal", which
@@ -46,45 +49,6 @@ array_agg_transfn_not_null(PG_FUNCTION_ARGS)
 	 */
 	PG_RETURN_POINTER(state);
 }
-
-Datum
-array_agg_finalfn_default_empty(PG_FUNCTION_ARGS)
-{
-	Datum		result;
-	ArrayBuildState *state;
-	int			dims[1];
-	int			lbs[1];
-	Oid			retType = get_fn_expr_rettype(fcinfo->flinfo);
-
-	/*
-	 * Test for null before Asserting we are in right context.	This is to
-	 * avoid possible Assert failure in 8.4beta installations, where it is
-	 * possible for users to create NULL constants of type internal.
-	 */
-	if (PG_ARGISNULL(0) || !state)
-		PG_RETURN_POINTER(construct_empty_array(retType));		/* returns null iff no input values */
-
-	/* cannot be called directly because of internal-type argument */
-	Assert(AggCheckCallContext(fcinfo, NULL));
-
-	state = (ArrayBuildState *) PG_GETARG_POINTER(0);
-
-	dims[0] = state->nelems;
-	lbs[0] = 1;
-
-	/*
-	 * Make the result.  We cannot release the ArrayBuildState because
-	 * sometimes aggregate final functions are re-executed.  Rather, it
-	 * is nodeAgg.c's responsibility to reset the aggcontext when it's
-	 * safe to do so.
-	 */
-	result = makeMdArrayResult(state, 1, dims, lbs,
-							   CurrentMemoryContext,
-							   false);
-
-	PG_RETURN_DATUM(result);
-}
-
 
 PG_MODULE_MAGIC;
 
