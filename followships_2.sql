@@ -6,7 +6,7 @@ CREATE SEQUENCE followships_seq;
 
 create table followships
 (
-    id int primary key default nextval('followships_seq'),
+    id bigint primary key default nextval('followships_seq'),
     follower_id int,
     friend_id int
 );
@@ -18,26 +18,26 @@ CREATE SEQUENCE followship_rollups_seq;
 
 create or replace function my_array_length(ary anyarray)
 returns integer
-LANGUAGE SQL AS $$
+LANGUAGE SQL IMMUTABLE AS $$
     select coalesce(array_length($1, 1), 0);
 $$;
 
 create table followship_rollups
 (
-    max_id int not null, -- for sorting
+    max_id bigint not null, -- for sorting
     user_id int not null,
     append_frozen bool default false not null,
-    follower_ids int[] not null CHECK (my_array_length(follower_ids) <= 256),
-    friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 256)
+    follower_ids int[] not null CHECK (my_array_length(follower_ids) <= 100),
+    friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 100)
 );
 
-create unique index only_one_non_frozen on followship_rollups(user_id, NULLIF(append_frozen, true)); -- NULLS are always unique from each other
+create unique index only_one_non_frozen on followship_rollups(user_id, append_frozen) where append_frozen is false; -- NULLS are always unique from each other
 
-create index followship_rollups_user_idx on followship_rollups(user_id);
-create index followship_rollups_append_frozen_idx on followship_rollups(append_frozen);
+create index followship_rollups_user_idx on followship_rollups(user_id, max_id);
+create index followship_rollups_append_frozen_idx on followship_rollups(append_frozen, user_id);
 
-create index followship_rollups_array_length_followers_idx on followship_rollups(array_length(follower_ids, 1));
-create index followship_rollups_array_length_friends_idx on followship_rollups(array_length(friend_ids, 1));
+create index followship_rollups_array_length_followers_idx on followship_rollups(user_id, my_array_length(follower_ids));
+create index followship_rollups_array_length_friends_idx on followship_rollups(user_id, my_array_length(friend_ids));
 
 create index followship_rollups_expanded_follower on followship_rollups using gin (follower_ids  gin__int_ops);
 create index followship_rollups_expanded_friend on followship_rollups using gin (friend_ids  gin__int_ops);
@@ -51,7 +51,7 @@ begin
     else return  array_append($1, $2);
     end if;
 end
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql IMMUTABLE ;
 -- :(
 CREATE AGGREGATE array_accum (anyelement) (
     sfunc = array_agg_transfn_override,
@@ -69,8 +69,8 @@ BEGIN
     (select  l.friend_id as user_id,
             trunc((
                 (count(*) OVER (partition by l.friend_id order by l.id)) +
-                case when fs.follower_ids is null then 256 else my_array_length(fs.follower_ids) end - 1)
-                / 256.0) as batch,
+                case when fs.follower_ids is null then 100 else my_array_length(fs.follower_ids) end - 1)
+                / 100.0) as batch,
             l.id as follower_ord_id,
             l.follower_id as follower_id,
             null::integer as friend_ord_id,
@@ -82,8 +82,8 @@ BEGIN
     (select  r.follower_id as user_id,
             trunc((
                 (count(*) OVER (partition by r.follower_id order by r.id)) +
-                case when fs.friend_ids is null then 256 else my_array_length(fs.friend_ids) end - 1)
-                / 256.0) as batch,
+                case when fs.friend_ids is null then 100 else my_array_length(fs.friend_ids) end - 1)
+                / 100.0) as batch,
             null::integer as follower_ord_id,
             null::integer as follower_id,
             r.id as friend_ord_id,
@@ -111,8 +111,8 @@ BEGIN
         set friend_ids   =  fbs.friend_ids   || coalesce(fs.friend_ids, ARRAY[]::int[]),
             follower_ids =  fbs.follower_ids || coalesce(fs.follower_ids, ARRAY[]::int[]),
             max_id = fbs.id,
-            append_frozen = my_array_length(fbs.friend_ids) + my_array_length(fs.friend_ids) >= 256 or
-                            my_array_length(fbs.follower_ids) + my_array_length(fs.follower_ids) >= 256
+            append_frozen = my_array_length(fbs.friend_ids) + my_array_length(fs.friend_ids) >= 100 or
+                            my_array_length(fbs.follower_ids) + my_array_length(fs.follower_ids) >= 100
         from followship_batches_rollup as fbs
         where fbs.user_id = fs.user_id
               and fbs.batch = 0
@@ -122,7 +122,7 @@ BEGIN
     raise log 'inserting rollups'; start := timeofday()::timestamptz;
     insert into followship_rollups 
         select id, user_id, 
-        my_array_length(follower_ids) >= 256 or my_array_length(friend_ids) >= 256 as append_frozen, 
+        my_array_length(follower_ids) >= 100 or my_array_length(friend_ids) >= 100 as append_frozen, 
         follower_ids, friend_ids
         from followship_batches_rollup
         where batch <> 0
@@ -183,6 +183,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+create view followers_of_order_desc as 
+    (select friend_id as user_id, follower_id from followships order by id desc)
+    union all
+    (select user_id, unnest(follower_ids) as friend_id from followship_rollups order by max_id desc)
+    ;
+
 create view friends_of_order_desc as 
     (select follower_id as user_id, friend_id from followships order by id desc)
     union all
@@ -194,3 +200,73 @@ RETURNS TABLE (friend_ids integer)
 LANGUAGE SQL AS $$
     select friend_id from friends_of_order_desc where user_id = $1 limit $2
 $$;
+
+create or replace function last_n_followers(user_id integer, n integer)
+RETURNS TABLE (follower_ids integer)
+LANGUAGE SQL AS $$
+    select follower_id from followers_of_order_desc where user_id = $1 limit $2
+$$;
+
+-- Return true or false if the friendship exists
+create or replace function has_follower(user_id integer, follower_id integer)
+returns boolean
+language sql as $$
+    (select true from followships where friend_id = $1 and follower_id = $2)
+    union all
+    (select true from followship_rollups where user_id = $1 and follower_ids @> ARRAY[$2])
+    union all
+    (select false)
+    limit 1
+    ;
+$$;
+
+
+-- Return true or false if the followership exists
+create or replace function has_friend(user_id integer, follower_id integer)
+returns boolean
+language sql as $$
+    (select true from followships where follower_id = $1 and friend_id = $2)
+    union all
+    (select true from followship_rollups where user_id = $1 and friend_ids @@ ARRAY[$2])
+    union all
+    (select false)
+    limit 1
+    ;
+$$;
+
+CREATE OR REPLACE FUNCTION delete_followship(follower integer, friend integer) RETURNS void AS $$
+DECLARE
+BEGIN
+    delete from followships where follower_id = $1 and friend_id = $2;
+
+    update followship_rollups
+        set follower_ids = follower_ids - $1::int
+        where followship_rollups.user_id = $2 and follower_ids && ARRAY[$1];
+
+    update followship_rollups
+        set friend_ids = friend_ids - $2::int
+        where followship_rollups.user_id = $1 and friend_ids && ARRAY[$1];
+        
+END
+$$ LANGUAGE plpgsql;
+
+create or replace function num_followers(user_id integer)
+returns int8
+language sql as $$
+    select sum(c)::int8 from ( 
+        (select my_array_length(follower_ids) as c from followship_rollups where user_id = $1)
+        union all
+        (select count(*) as c from followships where friend_id = $1)
+    ) as foo;
+$$;
+
+create or replace function num_friends(user_id integer)
+returns int8
+language sql as $$
+    select sum(c)::int8 from ( 
+        (select my_array_length(friend_ids) as c from followship_rollups where user_id = $1)
+        union all
+        (select count(*) as c from followships where follower_id = $1)
+    ) as foo;
+$$;
+
