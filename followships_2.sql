@@ -39,8 +39,8 @@ create index followship_rollups_append_frozen_idx on followship_rollups(append_f
 create index followship_rollups_array_length_followers_idx on followship_rollups(user_id, my_array_length(follower_ids));
 create index followship_rollups_array_length_friends_idx on followship_rollups(user_id, my_array_length(friend_ids));
 
-create index followship_rollups_expanded_follower on followship_rollups using gin (follower_ids  gin__int_ops);
-create index followship_rollups_expanded_friend on followship_rollups using gin (friend_ids  gin__int_ops);
+create index followship_rollups_expanded_follower on followship_rollups using gin (follower_ids);
+create index followship_rollups_expanded_friend on followship_rollups using gin (friend_ids);
 
 
 -- This takes twice as long as array_agg, but we can't use the nils
@@ -52,12 +52,6 @@ begin
     end if;
 end
 $$ LANGUAGE plpgsql IMMUTABLE ;
--- :(
-CREATE AGGREGATE array_accum (anyelement) (
-    sfunc = array_agg_transfn_override,
-    stype = anyarray,
-    initcond = '{}'
-);
 
 CREATE OR REPLACE FUNCTION move_friends_from(tablename text)
 RETURNS void as $$
@@ -241,11 +235,11 @@ BEGIN
 
     update followship_rollups
         set follower_ids = follower_ids - $1::int
-        where followship_rollups.user_id = $2 and follower_ids && ARRAY[$1];
+        where followship_rollups.user_id = $2 and follower_ids @> ARRAY[$1];
 
     update followship_rollups
         set friend_ids = friend_ids - $2::int
-        where followship_rollups.user_id = $1 and friend_ids && ARRAY[$1];
+        where followship_rollups.user_id = $1 and friend_ids @> ARRAY[$1];
         
 END
 $$ LANGUAGE plpgsql;
