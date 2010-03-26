@@ -44,7 +44,7 @@ This should be the only time we need to do this.
 
 To install the schema, run::
 
-  psql -f followships_2.sql
+  psql -f followships.sql
 
 
 Ok, our schema is installed.

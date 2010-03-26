@@ -1,292 +1,266 @@
-drop schema if exists social cascade;
-create schema social;
-set search_path to social, public;
+drop schema if exists followship cascade;
+create schema followship;
+set search_path to followship, public;
 
-create language plpgsql;
+CREATE SEQUENCE followships_seq;
 
-CREATE SEQUENCE friendships_seq;
-
-create table friendships
+create table followships
 (
-    id int not null default nextval('friendships_seq'),
-    follower int,
-    friend int
+    id bigint primary key default nextval('followships_seq'),
+    follower_id int,
+    friend_id int
 );
 
-create index friendships_follower_friend_idx on friendships(follower, friend);
-create index friendships_friend_follower_idx on friendships(friend, follower);
+create index followships_follower_friend_idx on followships(follower_id, friend_id);
+create index followships_friend_follower_idx on followships(friend_id, follower_id);
 
-CREATE SEQUENCE followers_a_seq;
+CREATE SEQUENCE followship_rollups_seq;
 
-create table followers_a
+create or replace function my_array_length(ary anyarray)
+returns integer
+LANGUAGE SQL IMMUTABLE AS $$
+    select coalesce(array_length($1, 1), 0);
+$$;
+
+create table followship_rollups
 (
-    id int not null default nextval('followers_a_seq'),
-    followers int[],
-    friend int,
-    --created_at timestamptz default now(),
-    append_frozen bool default false
+    max_id bigint not null, -- for sorting
+    user_id int not null,
+    append_frozen bool default false not null,
+    follower_ids int[] not null CHECK (my_array_length(follower_ids) <= 100),
+    friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 100)
 );
 
-create index followers_a_friend_idx on followers_a(friend);
-create index followers_a_append_frozen_idx on followers_a(append_frozen);
-create index followers_a_array_length_followers_idx on followers_a(array_length(followers, 1));
-create index followers_a_expanded on followers_a using gin (followers  gin__int_ops);
+create unique index only_one_non_frozen on followship_rollups(user_id, append_frozen) where append_frozen is false; -- NULLS are always unique from each other
 
--- Unpacsk and unions with the 
-create view friendships_friend_to_follower as 
-    select unnest(followers) as follower, friend from followers_a
-    union all select follower, friend from friendships;
+create index followship_rollups_user_idx on followship_rollups(user_id, max_id);
+create index followship_rollups_append_frozen_idx on followship_rollups(append_frozen, user_id);
 
--- does same, but ordered
-create view friendships_friend_to_follower_ordered_desc as 
-    (select follower, friend from friendships order by id desc)
-    union all 
-    (select unnest(followers) as follower, friend from followers_a order by id desc)
-    ;
+create index followship_rollups_array_length_followers_idx on followship_rollups(user_id, my_array_length(follower_ids));
+create index followship_rollups_array_length_friends_idx on followship_rollups(user_id, my_array_length(friend_ids));
 
-CREATE SEQUENCE friends_a_seq;
+create index followship_rollups_expanded_follower on followship_rollups using gin (follower_ids);
+create index followship_rollups_expanded_friend on followship_rollups using gin (friend_ids);
 
-create table friends_a
-( 
-    id int not null default nextval('friends_a_seq'),
-    follower int,
-    friends int[],
-    -- created_at timestamptz default now(),
-    append_frozen bool default false
-);
-create index friends_a_follower_idx on friends_a(follower);
-create index friends_a_append_frozen_idx on friends_a(append_frozen);
-create index friends_a_array_length_friends_idx on friends_a(array_length(friends, 1));
-create index friends_a_expanded on friends_a using gin (friends  gin__int_ops);
 
---unpacs friends_a
-create view friendships_follower_to_friend as 
-    select follower, unnest(friends) as friend from friends_a
-    union all select follower, friend from friendships;
+-- This takes twice as long as array_agg, but we can't use the nils
+create or replace function array_agg_transfn_override (state anyarray, new anyelement) 
+returns anyarray as $$
+begin
+    if $2 is null then return $1;
+    else return  array_append($1, $2);
+    end if;
+end
+$$ LANGUAGE plpgsql IMMUTABLE ;
 
---unpacs friends_a
-create view friendships_follower_to_friend_ordered_desc as 
-    (select follower, friend from friendships order by id desc)
+CREATE OR REPLACE FUNCTION move_friends_from(tablename text)
+RETURNS void as $$
+DECLARE start timestamptz;
+BEGIN
+    execute 'create temporary view followship_staging_v as select * from ' || quote_ident($1); -- Just make a view to make it easy
+
+    create temporary view followship_batches_union as
+    (select  l.friend_id as user_id,
+            trunc((
+                (count(*) OVER (partition by l.friend_id order by l.id)) +
+                case when fs.follower_ids is null then 100 else my_array_length(fs.follower_ids) end - 1)
+                / 100.0) as batch,
+            l.id as follower_ord_id,
+            l.follower_id as follower_id,
+            null::integer as friend_ord_id,
+            null::integer as friend_id
+            from followship_staging_v as l
+            left outer join followship_rollups as fs on (
+                l.friend_id = fs.user_id and fs.append_frozen is false))
     union all
-    (select follower, unnest(friends) as friend from friends_a order by id desc)
+    (select  r.follower_id as user_id,
+            trunc((
+                (count(*) OVER (partition by r.follower_id order by r.id)) +
+                case when fs.friend_ids is null then 100 else my_array_length(fs.friend_ids) end - 1)
+                / 100.0) as batch,
+            null::integer as follower_ord_id,
+            null::integer as follower_id,
+            r.id as friend_ord_id,
+            r.friend_id as friend_id
+        from followship_staging_v as r
+        left outer join followship_rollups as fs on (
+            r.follower_id = fs.user_id and fs.append_frozen is false));
+
+    raise log 'rolling up data into temp table'; start := timeofday()::timestamptz;
+    create temporary table followship_batches_rollup as
+    select
+        case when max(follower_ord_id) is not null then max(follower_ord_id) else max(friend_ord_id) end as id,
+        user_id,
+        batch,
+        coalesce(array_accum(follower_id order by follower_ord_id desc), ARRAY[]::int[]) as follower_ids,
+        coalesce(array_accum(friend_id order by friend_ord_id desc), ARRAY[]::int[]) as friend_ids
+    from followship_batches_union
+    group by user_id, batch;
+    raise log 'rollup finished. took %', timeofday()::timestamptz - start;
+
+
+    -- Populate followers_a
+    raise log 'updating rollups'; start := timeofday()::timestamptz;
+    update followship_rollups as fs
+        set friend_ids   =  fbs.friend_ids   || coalesce(fs.friend_ids, ARRAY[]::int[]),
+            follower_ids =  fbs.follower_ids || coalesce(fs.follower_ids, ARRAY[]::int[]),
+            max_id = fbs.id,
+            append_frozen = my_array_length(fbs.friend_ids) + my_array_length(fs.friend_ids) >= 100 or
+                            my_array_length(fbs.follower_ids) + my_array_length(fs.follower_ids) >= 100
+        from followship_batches_rollup as fbs
+        where fbs.user_id = fs.user_id
+              and fbs.batch = 0
+              and fs.append_frozen is false;
+    raise log 'updating rollups finished. took %', timeofday()::timestamptz - start;
+
+    raise log 'inserting rollups'; start := timeofday()::timestamptz;
+    insert into followship_rollups 
+        select id, user_id, 
+        my_array_length(follower_ids) >= 100 or my_array_length(friend_ids) >= 100 as append_frozen, 
+        follower_ids, friend_ids
+        from followship_batches_rollup
+        where batch <> 0
+        order by batch;
+    raise log 'inserting rollups finished. took %', timeofday()::timestamptz - start;
+
+    drop view followship_batches_union cascade;
+    drop view followship_staging_v cascade;
+    drop table followship_batches_rollup cascade;
+END;
+$$ LANGUAGE plpgsql;
+    
+CREATE OR REPLACE FUNCTION move_friends() RETURNS void AS $$
+DECLARE
+start timestamptz;
+BEGIN
+    --TODO have this delete the stuff from followships
+    raise log 'copying to staging'; start := timeofday()::timestamptz;
+    create temporary table followship_staging as select * from followships for update;
+    raise log 'staging copied  took %', timeofday()::timestamptz - start;
+    
+    perform move_friends_from('followship_staging');
+
+    raise log 'deleting old rows'; start := timeofday()::timestamptz;
+    delete from followships using followship_staging
+        where followships.id = followship_staging.id;
+    raise log 'deleting finished. took %', timeofday()::timestamptz - start;
+
+    drop table followship_staging cascade;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ONLY USE THIS when there's no stuff being loaded into followships
+CREATE OR REPLACE FUNCTION bulk_load_friends(filepath text) RETURNS void AS $$
+DECLARE
+start timestamptz;
+BEGIN
+
+    create temporary table followship_staging
+    (
+        id int not null default nextval('followships_seq'),
+        follower_id int,
+        friend_id int
+    );
+
+    --TODO have this delete the stuff from followships
+    raise notice 'copying to staging'; start := timeofday()::timestamptz;
+    execute 'copy followship_staging (follower_id, friend_id) from ' || quote_literal($1) || ' with csv';
+    raise notice 'staging copied  took %', timeofday()::timestamptz - start;
+    
+    raise notice 'moving friends from staging'; start := timeofday()::timestamptz;
+    perform move_friends_from('followship_staging');
+    raise notice 'move took  took %', timeofday()::timestamptz - start;
+
+    drop table followship_staging cascade;
+END;
+$$ LANGUAGE plpgsql;
+
+
+create view followers_of_order_desc as 
+    (select friend_id as user_id, follower_id from followships order by id desc)
+    union all
+    (select user_id, unnest(follower_ids) as friend_id from followship_rollups order by max_id desc)
     ;
 
+create view friends_of_order_desc as 
+    (select follower_id as user_id, friend_id from followships order by id desc)
+    union all
+    (select user_id, unnest(friend_ids) as friend_id from followship_rollups order by max_id desc)
+    ;
 
+create or replace function last_n_friends(user_id integer, n integer)
+RETURNS TABLE (friend_ids integer)
+LANGUAGE SQL AS $$
+    select friend_id from friends_of_order_desc where user_id = $1 limit $2
+$$;
 
+create or replace function last_n_followers(user_id integer, n integer)
+RETURNS TABLE (follower_ids integer)
+LANGUAGE SQL AS $$
+    select follower_id from followers_of_order_desc where user_id = $1 limit $2
+$$;
 
 -- Return true or false if the friendship exists
-create or replace function followship_exists(follower integer, friend integer)
+create or replace function has_follower(user_id integer, follower_id integer)
 returns boolean
 language sql as $$
-    (select true from friendships where follower = $1 and friend = $2)
+    (select true from followships where friend_id = $1 and follower_id = $2)
     union all
-    (select true from friends_a where follower = $1 and friends @> ARRAY[$2])
+    (select true from followship_rollups where user_id = $1 and follower_ids @> ARRAY[$2])
     union all
     (select false)
     limit 1
     ;
 $$;
 
-create or replace function num_friends(follower integer)
-RETURNS int8
-LANGUAGE SQL AS $$
-    select sum(c)::int8 from ( 
-        (select array_length(friends,1) as c from friends_a where follower = $1)
-        union all
-        (select count(*) as c from friendships where follower = $1)
-    ) as foo;
+
+-- Return true or false if the followership exists
+create or replace function has_friend(user_id integer, friend_id integer)
+returns boolean
+language sql as $$
+    (select true from followships where follower_id = $1 and friend_id = $2)
+    union all
+    (select true from followship_rollups where user_id = $1 and friend_ids @> ARRAY[$2])
+    union all
+    (select false)
+    limit 1
+    ;
 $$;
 
-
-create or replace function num_followers(friend integer)
-RETURNS int8
-LANGUAGE SQL AS $$
-    select sum(c)::int8 from ( 
-        (select array_length(followers,1) as c from followers_a where friend = $1)
-        union all
-        (select count(*) as c from friendships where friend = $1)
-    ) as foo;
-$$;
-
-
-
-
-create or replace function last_n_friends(follower integer, n integer)
-RETURNS TABLE (friend integer)
-LANGUAGE SQL AS $$
-    select friend from friendships_follower_to_friend_ordered_desc where follower = $1 limit $2
-$$;
-
--- Populate followers_a with data from friendships
-CREATE OR REPLACE FUNCTION delete_friendship(follower integer, friend integer) RETURNS void AS $$
+CREATE OR REPLACE FUNCTION delete_followship(follower integer, friend integer) RETURNS void AS $$
 DECLARE
 BEGIN
-    delete from friendships where friendships.follower = $1 and friendships.friend = $2;
+    delete from followships where follower_id = $1 and friend_id = $2;
 
-    update followers_a
-        set followers = followers - $1::int
-        where followers_a.friend = $2 and followers @> ARRAY[$1];
+    update followship_rollups
+        set follower_ids = followship_intarray_del_elem(follower_ids, $1)
+        where followship_rollups.user_id = $2 and follower_ids @> ARRAY[$1];
 
-    update friends_a
-        set friends = friends - $2::int
-        where friends_a.follower = $1 and friends @> ARRAY[$2];
+    update followship_rollups
+        set friend_ids = followship_intarray_del_elem(friend_ids, $2)
+        where followship_rollups.user_id = $1 and friend_ids @> ARRAY[$1];
+        
 END
 $$ LANGUAGE plpgsql;
 
-
-CREATE OR REPLACE FUNCTION cleanup ()
-RETURNS TABLE (id integer, follower integer, friend integer)
-LANGUAGE SQL AS $$
-    DELETE from friendships returning id, follower, friend;
+create or replace function num_followers(user_id integer)
+returns int8
+language sql as $$
+    select sum(c)::int8 from ( 
+        (select my_array_length(follower_ids) as c from followship_rollups where user_id = $1)
+        union all
+        (select count(*) as c from followships where friend_id = $1)
+    ) as foo;
 $$;
 
+create or replace function num_friends(user_id integer)
+returns int8
+language sql as $$
+    select sum(c)::int8 from ( 
+        (select my_array_length(friend_ids) as c from followship_rollups where user_id = $1)
+        union all
+        (select count(*) as c from followships where follower_id = $1)
+    ) as foo;
+$$;
 
-
--- Populate followers_a with data from friendships
-CREATE OR REPLACE FUNCTION move_friends() RETURNS void AS $$
-DECLARE
-BEGIN
---begin;
-
-
-    -- COPY TO A NEW TEMP TABLE where we have batches.
-    create temporary table batch_followers as
-    select f.follower, f.friend, f.id,
-            trunc(((rank() OVER
-                              (partition by f.friend order by f.id)) +
-                        COALESCE(array_length(foa.followers,1), 100) - 1) / 100.0) as follower_batch,
-            trunc(((rank() OVER
-                          (partition by f.follower order by f.id)) +
-                    COALESCE(array_length(ffa.friends,1), 100) - 1) / 100.0) as friend_batch
-
-            from cleanup() as f
-            left outer join followers_a as foa on (foa.friend = f.friend)
-            left outer join friends_a as ffa on (ffa.follower = f.follower)
-            where (ffa.append_frozen is not true and foa.append_frozen is not true);
-
-    create index bfo_id  on batch_followers(id);
-    create index bfo_fid on batch_followers(follower);
-    create index bff_fid on batch_followers(friend);
-    create index bfo_bid on batch_followers(follower_batch);
-    create index bff_bid on batch_followers(friend_batch);
-            
-    
-    analyze batch_followers;
-    
-    -- Populate followers_a
-    update followers_a as fs
-        set followers =  af.followers || fs.followers
-        from (
-            select array_agg(follower order by id desc) as followers, friend
-                from batch_followers
-                where follower_batch = 0
-                group by friend ) as af
-        where af.friend = fs.friend
-              and fs.append_frozen is false;
-
-    -- Insert the ones that didn't exist before (and the update didn't do)
-    insert into followers_a (followers, friend)
-        select array_agg(follower order by id desc), friend as followers
-        from batch_followers as bf
-        where bf.follower_batch <> 0
-        group by friend, bf.follower_batch
-        order by bf.follower_batch;
-        --where friend in ((select friend from followers_a where append_frozen is false) except (select friend from followers_a where append_frozen is false))
-        --where friend not in (select friend from followers_a where append_frozen is false intersect (select friend from friendships_temp))
-
-    -- Freeze the rows that have grown too big
-    update followers_a
-        set append_frozen = true
-        where array_length(followers, 1) >= 100
-              and append_frozen is false;
-
-    -- Populate followers_a
-    update friends_a as fs
-        set friends = af.friends || fs.friends
-        from (
-            select array_agg(friend order by id desc) as friends, follower
-                from batch_followers
-                where friend_batch = 0
-                group by follower) as af
-        where af.follower = fs.follower
-              and fs.append_frozen is false;
-
-
-    -- Insert the ones that didn't exist before (and the update didn't do)
-    insert into friends_a  (follower, friends)
-        select  follower as followers, array_agg(friend order by id desc)
-        from batch_followers as bf
-        where bf.friend_batch <> 0
-        --where follower in ((select follower from friendships_temp) except (select follower from friends_a where append_frozen is false))
-        --where follower not in (select follower from friends_a where append_frozen is false intersect (select follower from friendships_temp))
-        group by follower, bf.friend_batch
-        order by bf.friend_batch;
-        
-
-    -- Freeze the rows that have grown too big
-    update friends_a
-        set append_frozen = true
-        where array_length(friends, 1) >= 100
-              and append_frozen is false;
-
-    -- Populate friends_a
-    drop table batch_followers cascade;
---commit;
-    
-END;
-$$ LANGUAGE plpgsql;
-
-/*
--- some test data
-
---populate some data to copy over
-copy friendships (follower, friend) from stdin;
-1   1
-2   2
-1   2
-2   1
-2   3
-2   4
-2   5
-1   3
-4   1
-3   1
-\.
-
--- move the data over
-select move_friends();
-
-
-insert into friendships (follower, friend) select generate_series(100,200), 1;
-copy friendships (follower, friend) from stdin;
-1   6
-2   7
-1   2
-2   8
-2   66
-2   44
-2   33
-21  3
-44  1
-\.
-
-select move_friends();
-
-insert into friendships (follower, friend) select generate_series(200,300), 1;
-copy friendships (follower, friend) from stdin;
-1   6
-2   7
-1   2
-2   8
-2   66
-2   44
-2   33
-21  3
-44  1
-\.
-
-select move_friends();
-
-insert into friendships (follower, friend) select 1, generate_series(200,300);
-select * from friendships_friend_to_follower;
-*/
