@@ -227,7 +227,7 @@ returns boolean
 language sql as $$
     (select true from followships where follower_id = $1 and friend_id = $2)
     union all
-    (select true from followship_rollups where user_id = $1 and friend_ids @@ ARRAY[$2])
+    (select true from followship_rollups where user_id = $1 and friend_ids @> ARRAY[$2])
     union all
     (select false)
     limit 1
