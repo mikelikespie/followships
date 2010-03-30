@@ -24,17 +24,10 @@ $$;
 
 create table followship_rollups
 (
-    max_id bigint not null, -- for sorting
-    user_id int not null,
-    append_frozen bool default false not null,
-    follower_ids int[] not null CHECK (my_array_length(follower_ids) <= 100),
-    friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 100)
+    user_id int primary key not null,
+    follower_ids int[] not null,
+    friend_ids int[] not null
 );
-
-create unique index only_one_non_frozen on followship_rollups(user_id, append_frozen) where append_frozen is false; -- NULLS are always unique from each other
-
-create index followship_rollups_user_idx on followship_rollups(user_id, max_id);
-create index followship_rollups_append_frozen_idx on followship_rollups(append_frozen, user_id);
 
 create index followship_rollups_array_length_followers_idx on followship_rollups(user_id, my_array_length(follower_ids));
 create index followship_rollups_array_length_friends_idx on followship_rollups(user_id, my_array_length(friend_ids));
@@ -61,41 +54,27 @@ BEGIN
 
     create temporary view followship_batches_union as
     (select  l.friend_id as user_id,
-            trunc((
-                (count(*) OVER (partition by l.friend_id order by l.id)) +
-                case when fs.follower_ids is null then 100 else my_array_length(fs.follower_ids) end - 1)
-                / 100.0) as batch,
             l.id as follower_ord_id,
             l.follower_id as follower_id,
             null::integer as friend_ord_id,
             null::integer as friend_id
-            from followship_staging_v as l
-            left outer join followship_rollups as fs on (
-                l.friend_id = fs.user_id and fs.append_frozen is false))
+            from followship_staging_v as l)
     union all
     (select  r.follower_id as user_id,
-            trunc((
-                (count(*) OVER (partition by r.follower_id order by r.id)) +
-                case when fs.friend_ids is null then 100 else my_array_length(fs.friend_ids) end - 1)
-                / 100.0) as batch,
             null::integer as follower_ord_id,
             null::integer as follower_id,
             r.id as friend_ord_id,
             r.friend_id as friend_id
-        from followship_staging_v as r
-        left outer join followship_rollups as fs on (
-            r.follower_id = fs.user_id and fs.append_frozen is false));
+        from followship_staging_v as r);
 
     raise log 'rolling up data into temp table'; start := timeofday()::timestamptz;
-    create temporary table followship_batches_rollup as
+    create temporary view followship_batches_rollup as
     select
-        case when max(follower_ord_id) is not null then max(follower_ord_id) else max(friend_ord_id) end as id,
         user_id,
-        batch,
         coalesce(array_accum(follower_id order by follower_ord_id desc), ARRAY[]::int[]) as follower_ids,
         coalesce(array_accum(friend_id order by friend_ord_id desc), ARRAY[]::int[]) as friend_ids
     from followship_batches_union
-    group by user_id, batch;
+    group by user_id;
     raise log 'rollup finished. took %', timeofday()::timestamptz - start;
 
 
@@ -103,29 +82,21 @@ BEGIN
     raise log 'updating rollups'; start := timeofday()::timestamptz;
     update followship_rollups as fs
         set friend_ids   =  fbs.friend_ids   || coalesce(fs.friend_ids, ARRAY[]::int[]),
-            follower_ids =  fbs.follower_ids || coalesce(fs.follower_ids, ARRAY[]::int[]),
-            max_id = fbs.id,
-            append_frozen = my_array_length(fbs.friend_ids) + my_array_length(fs.friend_ids) >= 100 or
-                            my_array_length(fbs.follower_ids) + my_array_length(fs.follower_ids) >= 100
+            follower_ids =  fbs.follower_ids || coalesce(fs.follower_ids, ARRAY[]::int[])
         from followship_batches_rollup as fbs
-        where fbs.user_id = fs.user_id
-              and fbs.batch = 0
-              and fs.append_frozen is false;
+        where fbs.user_id = fs.user_id;
     raise log 'updating rollups finished. took %', timeofday()::timestamptz - start;
 
     raise log 'inserting rollups'; start := timeofday()::timestamptz;
     insert into followship_rollups 
-        select id, user_id, 
-        my_array_length(follower_ids) >= 100 or my_array_length(friend_ids) >= 100 as append_frozen, 
-        follower_ids, friend_ids
-        from followship_batches_rollup
-        where batch <> 0
-        order by batch;
+        select fbr.user_id, fbr.follower_ids, fbr.friend_ids
+        from followship_batches_rollup fbr
+        where fbr.user_id not in (select distinct user_id from followship_rollups); -- Instead of a not in. probably performs better
     raise log 'inserting rollups finished. took %', timeofday()::timestamptz - start;
 
+    drop view followship_batches_rollup cascade;
     drop view followship_batches_union cascade;
     drop view followship_staging_v cascade;
-    drop table followship_batches_rollup cascade;
 END;
 $$ LANGUAGE plpgsql;
     
@@ -180,13 +151,13 @@ $$ LANGUAGE plpgsql;
 create view followers_of_order_desc as 
     (select friend_id as user_id, follower_id from followships order by id desc)
     union all
-    (select user_id, unnest(follower_ids) as friend_id from followship_rollups order by max_id desc)
+    (select user_id, unnest(follower_ids) as friend_id from followship_rollups)
     ;
 
 create view friends_of_order_desc as 
     (select follower_id as user_id, friend_id from followships order by id desc)
     union all
-    (select user_id, unnest(friend_ids) as friend_id from followship_rollups order by max_id desc)
+    (select user_id, unnest(friend_ids) as friend_id from followship_rollups)
     ;
 
 create or replace function last_n_friends(user_id integer, n integer)
