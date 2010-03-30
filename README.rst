@@ -86,17 +86,17 @@ Querying
 
 A few functions are built in.  These include:
 
-``select num_friends(user_id)``
+``select * from num_friends(user_id)``
   Returns the number of friends that user has
 
-``select num_followers(user_id)``
+``select * from num_followers(user_id)``
   Returns the number of followers that user has
 
-``select has_friend(user_id integer, friend_id integer)``
+``select * from has_friend(user_id integer, friend_id integer)``
   returns ``true`` if ``user_id`` is following ``friend_id`` otherwise returns
   ``false``
 
-``select has_follower(user_id integer, follower_id integer)``
+``select * from has_follower(user_id integer, follower_id integer)``
   returns ``true`` if ``follower_id`` is following ``user_id`` otherwise returns
   ``false``. (you can find the same information with has_friend)
 
