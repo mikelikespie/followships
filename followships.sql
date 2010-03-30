@@ -162,20 +162,20 @@ create view friends_of_order_desc as
 
 create or replace function last_n_friends(user_id integer, n integer)
 RETURNS TABLE (friend_ids integer)
-LANGUAGE SQL AS $$
+LANGUAGE SQL STABLE AS $$
     select friend_id from friends_of_order_desc where user_id = $1 limit $2
 $$;
 
 create or replace function last_n_followers(user_id integer, n integer)
 RETURNS TABLE (follower_ids integer)
-LANGUAGE SQL AS $$
+LANGUAGE SQL STABLE AS $$
     select follower_id from followers_of_order_desc where user_id = $1 limit $2
 $$;
 
 -- Return true or false if the friendship exists
 create or replace function has_follower(user_id integer, follower_id integer)
-returns boolean
-language sql as $$
+RETURNS TABLE (has_follower boolean)
+language sql STABLE as $$
     (select true from followships where friend_id = $1 and follower_id = $2)
     union all
     (select true from followship_rollups where user_id = $1 and follower_ids @> ARRAY[$2])
@@ -188,8 +188,8 @@ $$;
 
 -- Return true or false if the followership exists
 create or replace function has_friend(user_id integer, friend_id integer)
-returns boolean
-language sql as $$
+RETURNS TABLE (has_friend boolean)
+language sql  STABLE as $$
     (select true from followships where follower_id = $1 and friend_id = $2)
     union all
     (select true from followship_rollups where user_id = $1 and friend_ids @> ARRAY[$2])
@@ -216,8 +216,8 @@ END
 $$ LANGUAGE plpgsql;
 
 create or replace function num_followers(user_id integer)
-returns int8
-language sql as $$
+RETURNS TABLE (num_followers int8)
+language sql STABLE as $$
     select sum(c)::int8 from ( 
         (select my_array_length(follower_ids) as c from followship_rollups where user_id = $1)
         union all
@@ -226,8 +226,8 @@ language sql as $$
 $$;
 
 create or replace function num_friends(user_id integer)
-returns int8
-language sql as $$
+RETURNS TABLE (num_friends int8)
+language sql STABLE as $$
     select sum(c)::int8 from ( 
         (select my_array_length(friend_ids) as c from followship_rollups where user_id = $1)
         union all
