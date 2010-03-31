@@ -31,7 +31,7 @@ create table followship_rollups
     friend_ids int[] not null CHECK (my_array_length(friend_ids) <= 100)
 );
 
-create unique index only_one_non_frozen on followship_rollups(user_id, append_frozen) where append_frozen is false; -- NULLS are always unique from each other
+create unique index only_one_non_frozen on followship_rollups(user_id, append_frozen) where append_frozen is false;
 
 create index followship_rollups_user_idx on followship_rollups(user_id, max_id);
 create index followship_rollups_append_frozen_idx on followship_rollups(append_frozen, user_id);
