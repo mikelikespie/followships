@@ -26,15 +26,10 @@ create table followship_rollups
 (
     user_id int primary key not null,
     follower_ids int[] not null,
-    friend_ids int[] not null
+    friend_ids int[] not null,
+    follower_set_ids intset not null,
+    friend_set_ids intset not null
 );
-
-create index followship_rollups_array_length_followers_idx on followship_rollups(user_id, my_array_length(follower_ids));
-create index followship_rollups_array_length_friends_idx on followship_rollups(user_id, my_array_length(friend_ids));
-
-create index followship_rollups_expanded_follower on followship_rollups using gin (follower_ids);
-create index followship_rollups_expanded_friend on followship_rollups using gin (friend_ids);
-
 
 -- This takes twice as long as array_agg, but we can't use the nils
 create or replace function array_agg_transfn_override (state anyarray, new anyelement) 
@@ -81,17 +76,23 @@ BEGIN
     -- Populate followers_a
     raise log 'updating rollups'; start := timeofday()::timestamptz;
     update followship_rollups as fs
-        set friend_ids   =  fbs.friend_ids   || coalesce(fs.friend_ids, ARRAY[]::int[]),
-            follower_ids =  fbs.follower_ids || coalesce(fs.follower_ids, ARRAY[]::int[])
+        set friend_ids   =  fbs.friend_ids   || fs.friend_ids,
+            follower_ids =  fbs.follower_ids || fs.follower_ids,
+			friend_set_ids = intset_union(fbs.friend_ids::intset, fs.friend_set_ids),
+			follower_set_ids = intset_union(fbs.follower_ids::intset, fs.follower_set_ids)
         from followship_batches_rollup as fbs
         where fbs.user_id = fs.user_id;
     raise log 'updating rollups finished. took %', timeofday()::timestamptz - start;
 
     raise log 'inserting rollups'; start := timeofday()::timestamptz;
     insert into followship_rollups 
-        select fbr.user_id, fbr.follower_ids, fbr.friend_ids
+        select fbr.user_id,
+	   		fbr.follower_ids,
+		   	fbr.friend_ids,
+		  	fbr.follower_ids::intset as follower_set_ids,
+		   	fbr.friend_ids::intset as friend_set_ids
         from followship_batches_rollup fbr
-        where fbr.user_id not in (select distinct user_id from followship_rollups); -- Instead of a not in. probably performs better
+        where not exists (select true from followship_rollups fr where user_id = fbr.user_id); -- Instead of a not in. probably performs better
     raise log 'inserting rollups finished. took %', timeofday()::timestamptz - start;
 
     drop view followship_batches_rollup cascade;
@@ -178,7 +179,7 @@ RETURNS TABLE (has_follower boolean)
 language sql STABLE as $$
     (select true from followships where friend_id = $1 and follower_id = $2)
     union all
-    (select true from followship_rollups where user_id = $1 and follower_ids @> ARRAY[$2])
+    (select true from followship_rollups where user_id = $1 and intset_exists(follower_set_ids, $2))
     union all
     (select false)
     limit 1
@@ -192,7 +193,7 @@ RETURNS TABLE (has_friend boolean)
 language sql  STABLE as $$
     (select true from followships where follower_id = $1 and friend_id = $2)
     union all
-    (select true from followship_rollups where user_id = $1 and friend_ids @> ARRAY[$2])
+    (select true from followship_rollups where user_id = $1 and intset_exists(friend_set_ids, $2))
     union all
     (select false)
     limit 1
